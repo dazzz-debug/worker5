@@ -1,0 +1,273 @@
+name: SCBUILD DAZZ
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Build Job ID"
+        required: true
+        type: string
+      userId:
+        description: "User ID"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "Build payload JSON"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scbuild-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip curl wget jq python3 file
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.7"
+          channel: stable
+          cache: true
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          java -version
+
+      - name: Parse payload
+        id: payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          data = json.loads(os.environ["PAYLOAD"])
+          mode = str(data.get("mode", "zip")).strip().lower()
+          url = str(data.get("url", "")).strip()
+          build_type = str(data.get("buildType", "release")).strip().lower()
+          if mode != "zip":
+              raise SystemExit("payload.mode must be zip")
+          if not url:
+              raise SystemExit("payload.url is required")
+          if build_type not in ("release", "debug"):
+              build_type = "release"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"mode={mode}\n")
+              f.write(f"url={url}\n")
+              f.write(f"build_type={build_type}\n")
+          PY
+
+      - name: Download source ZIP
+        env:
+          SOURCE_URL: ${{ steps.payload.outputs.url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/input" "$GITHUB_WORKSPACE/project"
+          mkdir -p "$GITHUB_WORKSPACE/input" "$GITHUB_WORKSPACE/project"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3             --connect-timeout 30 --max-time 900             "$SOURCE_URL" -o "$GITHUB_WORKSPACE/input/source.zip"
+          test -s "$GITHUB_WORKSPACE/input/source.zip"
+          unzip -q "$GITHUB_WORKSPACE/input/source.zip" -d "$GITHUB_WORKSPACE/project"
+
+      - name: Locate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$(find "$GITHUB_WORKSPACE/project" -type f -name "pubspec.yaml" -not -path "*/.dart_tool/*" -print -quit | xargs -r dirname)"
+          if [ -z "${ROOT:-}" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            find "$GITHUB_WORKSPACE/project" -maxdepth 5 -type f -print | head -300
+            exit 1
+          fi
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$ROOT"
+
+      - name: Prepare Android compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          if [ ! -d "android" ]; then
+            echo "::error::Folder android tidak ditemukan."
+            exit 1
+          fi
+          touch android/gradle.properties
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("android/gradle.properties")
+          text = p.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+          lines = []
+          for line in text.splitlines():
+              s = line.strip()
+              if s.startswith("android.newDsl=") or s.startswith("android.builtInKotlin="):
+                  continue
+              lines.append(line)
+          lines.append("android.newDsl=false")
+          lines.append("android.builtInKotlin=false")
+          p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          cat android/gradle.properties
+
+      - name: Prepare Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          if [ -x "android/gradlew" ]; then
+            chmod +x android/gradlew
+            echo "Source Gradle wrapper exists."
+            exit 0
+          fi
+
+          echo "Source has no executable Gradle wrapper."
+
+          GRADLE_VERSION="8.11.1"
+          GRADLE_HOME="$RUNNER_TEMP/gradle-$GRADLE_VERSION"
+          GRADLE_ZIP="$RUNNER_TEMP/gradle-$GRADLE_VERSION.zip"
+          GRADLE_TMP="$RUNNER_TEMP/gradle-unpack-$GRADLE_VERSION"
+
+          rm -rf "$GRADLE_HOME" "$GRADLE_TMP" "$GRADLE_ZIP"
+          mkdir -p "$GRADLE_TMP"
+
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3             --connect-timeout 30 --max-time 900             "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"             -o "$GRADLE_ZIP"
+
+          test -s "$GRADLE_ZIP"
+          unzip -q "$GRADLE_ZIP" -d "$GRADLE_TMP"
+
+          if [ ! -x "$GRADLE_TMP/gradle-$GRADLE_VERSION/bin/gradle" ]; then
+            echo "::error::Gradle extraction failed."
+            find "$GRADLE_TMP" -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          mkdir -p "$GRADLE_HOME"
+          cp -a "$GRADLE_TMP/gradle-$GRADLE_VERSION/." "$GRADLE_HOME/"
+
+          if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
+            echo "::error::Gradle executable was not installed."
+            exit 1
+          fi
+
+          echo "GRADLE_HOME=$GRADLE_HOME" >> "$GITHUB_ENV"
+
+          mkdir -p android/gradle/wrapper
+
+          cat > android/gradlew <<EOF
+          #!/bin/sh
+          set -e
+          exec "$GRADLE_HOME/bin/gradle" "\$@"
+          EOF
+          chmod +x android/gradlew
+
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<EOF
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-all.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+          "$GRADLE_HOME/bin/gradle" --version
+
+      - name: Flutter clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter clean
+          rm -rf .dart_tool build
+
+      - name: Flutter pub get
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter pub get
+
+      - name: Build APK
+        env:
+          BUILD_TYPE: ${{ steps.payload.outputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug --no-tree-shake-icons
+          else
+            flutter build apk --release --no-tree-shake-icons
+          fi
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          APK="$(find "$PROJECT_ROOT/build/app/outputs/flutter-apk" -type f -name "*.apk" -print -quit)"
+          if [ -z "${APK:-}" ]; then
+            echo "::error::APK tidak ditemukan."
+            find "$PROJECT_ROOT/build" -type f -name "*.apk" -print 2>/dev/null || true
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/output/app-${JOB_ID}.apk"
+          echo "APK=$GITHUB_WORKSPACE/output/app-${JOB_ID}.apk" >> "$GITHUB_ENV"
+          ls -lh "$GITHUB_WORKSPACE/output/app-${JOB_ID}.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: output/app-${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## SCBUILD DAZZ"
+            echo ""
+            echo "- Job ID: \`${JOB_ID}\`"
+            echo "- User ID: \`${USER_ID}\`"
+            echo "- Mode: \`${{ steps.payload.outputs.mode }}\`"
+            echo "- Build type: \`${{ steps.payload.outputs.build_type }}\`"
+            if [ -n "${APK:-}" ] && [ -f "$APK" ]; then
+              echo "- APK size: $(du -h "$APK" | cut -f1)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
